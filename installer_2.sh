@@ -55,6 +55,7 @@ ensure_snapd() {
   if ! command -v snap >/dev/null 2>&1; then
     echo "snap not found; installing snapd…"
     apt_install snapd
+    # snap needs systemd services active; give it a moment
     sleep 2
   fi
 }
@@ -74,24 +75,6 @@ snap_install_if_missing() {
   fi
 }
 
-docker_installed() {
-  command -v docker >/dev/null 2>&1
-}
-
-docker_service_active() {
-  systemctl is-active --quiet docker
-}
-
-docker_container_exists() {
-  local name="$1"
-  $SUDO docker ps -a --format '{{.Names}}' | grep -qx "$name"
-}
-
-docker_container_running() {
-  local name="$1"
-  $SUDO docker ps --format '{{.Names}}' | grep -qx "$name"
-}
-
 # ----------------------- steps -----------------------
 main() {
   require_sudo
@@ -102,7 +85,7 @@ main() {
   DEBIAN_FRONTEND=noninteractive $SUDO apt-get upgrade -y
 
   echo "==> Installing base packages…"
-  # Added 'git' here
+  # ADDED: git
   apt_install ca-certificates gnupg curl zfsutils-linux git
 
   echo "==> Importing ZFS pool 'tank' (if present)…"
@@ -110,6 +93,7 @@ main() {
     if zpool list -H -o name 2>/dev/null | grep -qx "tank"; then
       echo "✓ 'tank' already imported"
     else
+      # Probe for available pools first
       if zpool import 2>/dev/null | grep -q "^   tank\b"; then
         if $SUDO zpool import tank; then
           echo "✓ Imported pool 'tank'"
@@ -129,23 +113,25 @@ main() {
   # Official installer (creates/updates systemd service)
   # shellcheck disable=SC2312
   curl -fsSL https://ollama.com/install.sh | $SUDO sh
+  # Ensure service is enabled and running
   if systemctl list-unit-files | grep -q '^ollama.service'; then
     $SUDO systemctl enable --now ollama || true
   fi
 
   echo "==> Installing Docker Engine + CLI + Compose plugin…"
-  if docker_installed; then
+  if command -v docker >/dev/null 2>&1; then
     echo "✓ docker already installed ($(docker --version || true))"
   else
     # Remove conflicting packages if present (safe to run)
     $SUDO apt-get remove -y docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc || true
 
-    # Add Docker's official APT repo
+    # Add Docker's official APT repo/key
     $SUDO install -m 0755 -d /etc/apt/keyrings
     if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
       curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
       $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
     fi
+    # shellcheck disable=SC1091
     source /etc/os-release
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" \
       | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
@@ -157,18 +143,16 @@ main() {
     $SUDO systemctl enable --now docker
   fi
 
-  if docker_service_active; then
-    echo "✓ docker service running"
-  else
-    echo "⚠ docker service is not active; attempting to start…"
-    $SUDO systemctl start docker || true
-  fi
+  # Optional: if you prefer non-sudo docker, uncomment next two lines, then log out/in after running the script.
+  # if ! id -nG "$USER" | grep -qw docker; then
+  #   $SUDO usermod -aG docker "$USER" || true
+  # fi
 
   echo "==> Deploying Open WebUI (Docker)…"
   # Run Open WebUI on localhost:3000. Persist data to named volume 'open-webui'.
-  # We explicitly set OLLAMA_BASE_URL and add the host.docker.internal alias for Linux.
-  if docker_container_exists "open-webui"; then
-    if docker_container_running "open-webui"; then
+  # Map host.docker.internal for Linux; point to local Ollama on 11434.
+  if $SUDO docker ps -a --format '{{.Names}}' | grep -qx "open-webui"; then
+    if $SUDO docker ps --format '{{.Names}}' | grep -qx "open-webui"; then
       echo "✓ open-webui container already running"
     else
       echo "ℹ Starting existing open-webui container…"
@@ -195,8 +179,7 @@ main() {
 
   echo "==> All done."
   echo "• Open WebUI: http://localhost:3000"
-  echo "• If you prefer not to use 'sudo docker', consider adding your user to the 'docker' group and re-login:"
-  echo "    sudo usermod -aG docker \$USER"
+  echo "• If you were added to any new system groups (e.g., docker), you may need to log out/in."
 }
 
 main "$@"
