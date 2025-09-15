@@ -26,7 +26,7 @@ Open WebUI connects to your local Ollama server, giving you a browser-based inte
 Clone this repo and run the installer:
 
 ```bash
-git clone https://github.com/yourusername/ollama-openwebui-setup.git
+git clone https://github.com/maykef/ollama-openwebui-setup.git
 cd ollama-openwebui-setup
 chmod +x install.sh
 ./install.sh
