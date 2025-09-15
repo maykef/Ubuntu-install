@@ -3,6 +3,7 @@
 # - system update/upgrade
 # - zfsutils-linux + import pool 'tank'
 # - curl
+# - git
 # - Ollama (official installer)
 # - Docker Engine + Compose plugin (no Docker Desktop)
 # - Open WebUI (Docker container)
@@ -101,7 +102,8 @@ main() {
   DEBIAN_FRONTEND=noninteractive $SUDO apt-get upgrade -y
 
   echo "==> Installing base packages…"
-  apt_install ca-certificates gnupg curl zfsutils-linux
+  # Added 'git' here
+  apt_install ca-certificates gnupg curl zfsutils-linux git
 
   echo "==> Importing ZFS pool 'tank' (if present)…"
   if command -v zpool >/dev/null 2>&1; then
