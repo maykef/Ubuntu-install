@@ -10,6 +10,11 @@
 # - Docker Engine + CLI + Compose plugin
 # - Deploy Open WebUI (Docker)
 # - Install GUI apps via snap
+#
+# DNS note:
+# Docker daemon uses the host's /etc/resolv.conf (at daemon start) to resolve registries.
+# This script ensures host-level DNS is sane so pulls from ghcr.io succeed, *then*
+# optionally sets container-level DNS in /etc/docker/daemon.json for consistency.
 
 set -euo pipefail
 
@@ -129,17 +134,88 @@ import_zfs_tank() {
   fi
 }
 
-# ---------- FIX #2: Docker DNS fallback ----------
+# ---------- FIX #2: DNS for Docker pulls (host-level + container-level) ----------
+resolved_is_active() {
+  systemctl is-active --quiet systemd-resolved
+}
+
+ensure_host_dns_upstreams() {
+  # Configure systemd-resolved with global upstreams if it is present.
+  if command -v resolvectl >/dev/null 2>&1 || systemctl list-unit-files | grep -q '^systemd-resolved.service'; then
+    $SUDO install -m 0644 -D /dev/null /etc/systemd/resolved.conf || true
+    # Merge/patch resolved.conf (idempotent).
+    if ! grep -q '^\[Resolve\]' /etc/systemd/resolved.conf 2>/dev/null; then
+      echo '[Resolve]' | $SUDO tee /etc/systemd/resolved.conf >/dev/null
+    fi
+    # Set DNS and FallbackDNS (Cloudflare + Google + Quad9 fallback)
+    if grep -q '^DNS=' /etc/systemd/resolved.conf; then
+      $SUDO sed -i 's/^DNS=.*/DNS=1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4/' /etc/systemd/resolved.conf
+    else
+      echo 'DNS=1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4' | $SUDO tee -a /etc/systemd/resolved.conf >/dev/null
+    fi
+    if grep -q '^FallbackDNS=' /etc/systemd/resolved.conf; then
+      $SUDO sed -i 's/^FallbackDNS=.*/FallbackDNS=9.9.9.9 149.112.112.112/' /etc/systemd/resolved.conf
+    else
+      echo 'FallbackDNS=9.9.9.9 149.112.112.112' | $SUDO tee -a /etc/systemd/resolved.conf >/dev/null
+    fi
+    # Ensure stub listener is enabled (so /run/systemd/resolve/resolv.conf is populated)
+    if grep -q '^DNSStubListener=' /etc/systemd/resolved.conf; then
+      $SUDO sed -i 's/^DNSStubListener=.*/DNSStubListener=yes/' /etc/systemd/resolved.conf
+    else
+      echo 'DNSStubListener=yes' | $SUDO tee -a /etc/systemd/resolved.conf >/dev/null
+    fi
+
+    $SUDO systemctl enable --now systemd-resolved || true
+
+    # Point /etc/resolv.conf at systemd-resolved's generated file, NOT the 127.0.0.53 stub.
+    if [ -L /etc/resolv.conf ]; then
+      target="$(readlink -f /etc/resolv.conf || true)"
+      if [ "$target" != "/run/systemd/resolve/resolv.conf" ]; then
+        $SUDO ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+      fi
+    else
+      $SUDO mv -f /etc/resolv.conf /etc/resolv.conf.backup.$(date +%s) 2>/dev/null || true
+      $SUDO ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+    fi
+
+    $SUDO systemctl restart systemd-resolved
+    sleep 1
+  else
+    # No systemd-resolved: write a sane static resolv.conf for the host (affects docker daemon).
+    if ! grep -Eq 'nameserver (1\.1\.1\.1|8\.8\.8\.8)' /etc/resolv.conf 2>/dev/null; then
+      echo "nameserver 1.1.1.1
+nameserver 8.8.8.8
+options timeout:2 attempts:2 rotate" | $SUDO tee /etc/resolv.conf >/dev/null
+    fi
+  fi
+}
+
+test_host_dns() {
+  getent ahosts "$1" >/dev/null 2>&1
+}
+
 ensure_docker_dns() {
-  echo "==> Checking DNS resolution for ghcr.io…"
-  if getent ahosts ghcr.io >/dev/null 2>&1; then
-    echo "✓ DNS resolution for ghcr.io is OK"
-    return 0
+  local test_host="ghcr.io"
+  echo "==> Checking host DNS resolution for ${test_host} …"
+  if test_host_dns "$test_host"; then
+    echo "✓ Host DNS can resolve ${test_host}"
+  else
+    echo "⚠ Host DNS cannot resolve ${test_host}; fixing host DNS…"
+    ensure_host_dns_upstreams
+    if ! test_host_dns "$test_host"; then
+      echo "⚠ DNS still failing at host level. Check your uplink/DHCP or firewall."
+      # Continue anyway; user may be offline.
+    else
+      echo "✓ Host DNS fixed"
+    fi
   fi
 
-  echo "⚠ DNS lookup for ghcr.io failed via systemd-resolved (127.0.0.53)."
-  echo "   Applying Docker-specific DNS fallback…"
+  # Docker daemon uses the host's /etc/resolv.conf for registry resolution.
+  # Restart docker so it picks up any resolv.conf change.
+  $SUDO systemctl restart docker || true
+  sleep 1
 
+  # Keep container-level DNS for consistency (optional but helpful).
   $SUDO install -d -m 0755 /etc/docker
   if [[ -f /etc/docker/daemon.json ]]; then
     if grep -q '"dns"' /etc/docker/daemon.json; then
@@ -155,15 +231,12 @@ ensure_docker_dns() {
 JSON
   fi
 
-  $SUDO systemctl restart docker
+  $SUDO systemctl restart docker || true
   sleep 1
 
-  if getent ahosts ghcr.io >/dev/null 2>&1; then
-    echo "✓ DNS resolution for ghcr.io is OK after fallback"
-    return 0
-  else
-    echo "⚠ DNS still failing. Check your network or set global DNS in /etc/systemd/resolved.conf."
-    return 1
+  # Quick sanity: try to reach ghcr.io (without actually pulling)
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSI https://ghcr.io/ >/dev/null 2>&1 && echo "✓ Reached ghcr.io over HTTPS" || echo "⚠ HTTPS reachability test failed (but DNS may now be OK)"
   fi
 }
 
