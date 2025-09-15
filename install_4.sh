@@ -118,25 +118,30 @@ main() {
   apt_install ca-certificates gnupg curl zfsutils-linux git
 
   echo "==> Importing ZFS pool 'tank' (if present)…"
-  if command -v zpool >/dev/null 2>&1; then
-    if zpool list -H -o name 2>/dev/null | grep -qx "tank"; then
-      echo "✓ 'tank' already imported"
-    else
-      # Probe for available pools first
-      if zpool import 2>/dev/null | grep -q "^   tank\b"; then
-        if $SUDO zpool import tank; then
-          echo "✓ Imported pool 'tank'"
-        else
-          echo "⚠ Could not import 'tank' automatically. If this pool was used on another system recently, you may need:"
-          echo "   sudo zpool import -f tank"
-        fi
-      else
-        echo "ℹ No exportable pool named 'tank' detected. Skipping."
-      fi
-    fi
+if command -v zpool >/dev/null 2>&1; then
+  # Make sure the module is loaded (harmless if already loaded)
+  $SUDO modprobe zfs || true
+
+  if zpool list -H -o name 2>/dev/null | grep -qx "tank"; then
+    echo "✓ 'tank' already imported"
   else
-    echo "⚠ zpool command not found even after installing zfsutils-linux."
+    # Look for pools available to import; parse the canonical "pool: NAME" line
+    if zpool import 2>/dev/null | awk '/^[[:space:]]*pool:[[:space:]]+/{print $2}' | grep -qx "tank"; then
+      # Try normal import first, then forced import (hostid mismatch, etc.)
+      if $SUDO zpool import tank 2>/dev/null || $SUDO zpool import -f tank 2>/dev/null; then
+        echo "✓ Imported pool 'tank'"
+      else
+        echo "⚠ Could not import 'tank' automatically."
+        echo "   Tips: check 'zpool status -v', ensure devices are present, and try:"
+        echo "   sudo zpool import -f tank"
+      fi
+    else
+      echo "ℹ No exportable pool named 'tank' detected. Skipping."
+    fi
   fi
+else
+  echo "⚠ zpool command not found even after installing zfsutils-linux."
+fi
 
   echo "==> Installing Ollama…"
   # Official installer (creates/updates systemd service)
